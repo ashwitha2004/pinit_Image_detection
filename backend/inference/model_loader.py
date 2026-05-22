@@ -386,12 +386,48 @@ def _try_load_pth(
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve_checkpoint_order() -> list:
+    """
+    Return the checkpoint search list, optionally reordered by the
+    AI_DETECTOR_BACKEND environment variable.
+
+    AI_DETECTOR_BACKEND=onnx  — prefer the .onnx checkpoint over .pth
+                                (useful for cloud deployment where ONNX RT
+                                 is 2–3× faster on CPU).
+    AI_DETECTOR_BACKEND=pytorch (default) — standard priority order.
+
+    Set in shell:
+        export AI_DETECTOR_BACKEND=onnx    (Linux/macOS)
+        set    AI_DETECTOR_BACKEND=onnx    (Windows)
+    Or in backend/.env:
+        AI_DETECTOR_BACKEND=onnx
+    """
+    import os
+    backend_pref = os.environ.get("AI_DETECTOR_BACKEND", "pytorch").strip().lower()
+
+    if backend_pref == "onnx":
+        # Move .onnx paths to the front, keep .pth paths as fallback
+        onnx_paths = [p for p in CHECKPOINT_PATHS if p.suffix == ".onnx"]
+        pth_paths  = [p for p in CHECKPOINT_PATHS if p.suffix != ".onnx"]
+        ordered    = onnx_paths + pth_paths
+        logger.info(
+            "[ModelLoader] AI_DETECTOR_BACKEND=onnx — ONNX Runtime preferred over PyTorch."
+        )
+        return ordered
+
+    return list(CHECKPOINT_PATHS)   # default priority
+
+
 def get_model() -> Tuple[Optional[object], Optional[str]]:
     """
     Return (model_wrapper, device).
     model_wrapper has .predict(orig_tensor, resid_tensor) → (ai_prob, cam_prob).
     Returns (None, "none") when torch/onnxruntime are unavailable.
     Thread-safe; loads once per process.
+
+    Backend selection:
+        Set env var AI_DETECTOR_BACKEND=onnx to prefer ONNX Runtime.
+        Default is PyTorch (.pth checkpoint takes priority).
     """
     global _model_cache, _onnx_cache, _device_cache, _temperature_cache, _load_time, \
            _has_trained_weights, _loaded_checkpoint, _architecture_cache
@@ -406,7 +442,7 @@ def get_model() -> Tuple[Optional[object], Optional[str]]:
         t0            = time.time()
         model_classes = _import_model_classes()
 
-        for cp in CHECKPOINT_PATHS:
+        for cp in _resolve_checkpoint_order():
             if not cp.exists():
                 continue
 

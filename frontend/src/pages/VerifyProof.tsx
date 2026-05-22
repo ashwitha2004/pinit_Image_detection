@@ -63,9 +63,14 @@ const VerifyProof = () => {
   const [verificationResult, setVerificationResult] = useState<VerificationResult | null>(null);
   const [verificationMode, setVerificationMode] = useState<'auto' | 'advanced' | 'simple'>('auto');
   const [showCameraModal, setShowCameraModal] = useState(false);
-  
+
+  // ── Failure-reporting state ────────────────────────────────────────────────
+  type ReportState = 'idle' | 'selecting' | 'submitting' | 'success' | 'error';
+  const [reportState, setReportState]     = useState<ReportState>('idle');
+  const [reportMessage, setReportMessage] = useState<string>('');
+
   const fileInputRef = useRef<HTMLInputElement>(null);
-  
+
   // Removed AI detection initialization as it's not being used
 
   const handleImageSelect = (imageData: string, fileName: string, source: 'upload' | 'camera' = 'upload') => {
@@ -325,8 +330,57 @@ const VerifyProof = () => {
     setSelectedImage(null);
     setSelectedFileName(null);
     setVerificationResult(null);
+    setReportState('idle');
+    setReportMessage('');
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
+    }
+  };
+
+  // ── Report-wrong-detection handler ─────────────────────────────────────────
+  const reportWrongDetection = async (correction: 'ai' | 'camera' | null) => {
+    if (!selectedImage || !verificationResult) return;
+
+    setReportState('submitting');
+
+    // Derive predicted label from the result's AI probability
+    const predictedLabel: 'ai' | 'camera' =
+      (verificationResult.aiProbability ?? verificationResult.aiGeneratedProbability ?? 0) >= 50
+        ? 'ai'
+        : 'camera';
+
+    const BACKEND_URL: string =
+      (import.meta as any).env?.VITE_BACKEND_URL ||
+      (window.location.hostname === 'localhost' ? 'http://localhost:8000' : '');
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/inference/report-failure`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image_base64:      selectedImage,
+          filename:          selectedFileName || 'image.jpg',
+          predicted_label:   predictedLabel,
+          ai_probability:    (verificationResult.aiProbability ?? 0) / 100,
+          camera_probability:(verificationResult.cameraProbability ?? 0) / 100,
+          confidence:        verificationResult.confidence ?? 0,
+          correction_label:  correction,
+        }),
+      });
+
+      if (res.ok) {
+        setReportState('success');
+        setReportMessage('Saved! This image will help improve future accuracy.');
+      } else {
+        const text = await res.text().catch(() => '');
+        console.warn('[ReportFailure] Backend error:', res.status, text.slice(0, 200));
+        setReportState('error');
+        setReportMessage('Could not save report — please try again later.');
+      }
+    } catch (err) {
+      console.warn('[ReportFailure] Fetch failed:', err);
+      setReportState('error');
+      setReportMessage('Backend unreachable — report could not be saved.');
     }
   };
 
@@ -1057,6 +1111,65 @@ const VerifyProof = () => {
                   );
                 })()}
                 {/* ─── end forensic meta analysis ─── */}
+
+                {/* ── Report Wrong Detection ──────────────────────────────── */}
+                <div className="mt-6">
+                  {reportState === 'idle' && (
+                    <div className="flex justify-center">
+                      <button
+                        onClick={() => setReportState('selecting')}
+                        className="text-xs text-slate-500 hover:text-amber-400 underline underline-offset-2 transition-colors duration-150"
+                      >
+                        ⚑ Report Wrong Detection
+                      </button>
+                    </div>
+                  )}
+
+                  {reportState === 'selecting' && (
+                    <div className="bg-slate-900/60 border border-amber-600/25 rounded-xl p-5 space-y-3">
+                      <p className="text-xs font-semibold text-amber-400 uppercase tracking-widest text-center">
+                        What is the correct label for this image?
+                      </p>
+                      <div className="flex flex-wrap gap-3 justify-center">
+                        <button
+                          onClick={() => reportWrongDetection('camera')}
+                          className="px-4 py-2 rounded-lg bg-emerald-800/30 border border-emerald-600/40 text-emerald-300 text-xs font-semibold hover:bg-emerald-700/50 transition-colors"
+                        >
+                          📷 Real Camera Photo
+                        </button>
+                        <button
+                          onClick={() => reportWrongDetection('ai')}
+                          className="px-4 py-2 rounded-lg bg-rose-800/30 border border-rose-600/40 text-rose-300 text-xs font-semibold hover:bg-rose-700/50 transition-colors"
+                        >
+                          🤖 AI Generated
+                        </button>
+                        <button
+                          onClick={() => setReportState('idle')}
+                          className="px-4 py-2 rounded-lg bg-slate-700/30 border border-slate-600/40 text-slate-400 text-xs font-semibold hover:bg-slate-600/50 transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {reportState === 'submitting' && (
+                    <div className="flex items-center justify-center gap-2 text-xs text-slate-400 py-2">
+                      <div className="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" />
+                      Saving report…
+                    </div>
+                  )}
+
+                  {(reportState === 'success' || reportState === 'error') && (
+                    <div className={`flex items-center justify-center gap-2 text-xs font-medium py-2 ${
+                      reportState === 'success' ? 'text-emerald-400' : 'text-red-400'
+                    }`}>
+                      <span>{reportState === 'success' ? '✓' : '✗'}</span>
+                      <span>{reportMessage}</span>
+                    </div>
+                  )}
+                </div>
+                {/* ── end report wrong detection ── */}
 
               </div>
             ) : (

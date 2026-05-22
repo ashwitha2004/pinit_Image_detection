@@ -437,6 +437,120 @@ async def get_confusion_matrix():
     )
 
 
+# ── Failure Reporting ─────────────────────────────────────────────────────────
+
+class ReportFailureRequest(BaseModel):
+    """JSON body for POST /report-failure."""
+    image_base64:      str   = Field(..., description="Data URL or raw base64 of the image")
+    filename:          str   = Field(default="image.jpg", description="Original filename hint")
+    predicted_label:   str   = Field(..., description="Model prediction: 'ai' | 'camera'")
+    ai_probability:    float = Field(..., ge=0.0, le=1.0, description="Model AI probability (0-1)")
+    camera_probability: float = Field(..., ge=0.0, le=1.0, description="Model camera probability (0-1)")
+    confidence:        float = Field(default=0.0, ge=0.0, le=100.0, description="Fusion confidence pct (0-100)")
+    correction_label:  Optional[str] = Field(
+        default=None,
+        description="User-supplied ground truth: 'ai' | 'camera' | null (unreviewed)"
+    )
+
+
+class ReportFailureResponse(BaseModel):
+    success:    bool
+    message:    str
+    saved_path: Optional[str] = None
+    subfolder:  Optional[str] = None
+
+
+_VALID_LABELS = {"ai", "camera"}
+
+
+@router.post("/report-failure", response_model=ReportFailureResponse)
+async def report_failure(req: ReportFailureRequest = Body(...)):
+    """
+    Accept a user-reported incorrect prediction and persist the image for
+    future hard-negative retraining.
+
+    The image is stored in collect_failures/ with the following routing:
+      correction_label == "ai"     → collect_failures/ai/
+      correction_label == "camera" → collect_failures/real/
+      correction_label is None     → collect_failures/unreviewed/
+
+    Each image is deduplicated by SHA-256 hash so reporting the same image
+    multiple times is safe.  A JSON sidecar is written alongside each image
+    with prediction metadata for the retraining script.
+
+    This endpoint does NOT touch inference logic or existing datasets.
+    """
+    # ── Validate labels ───────────────────────────────────────────────────────
+    if req.predicted_label not in _VALID_LABELS:
+        raise HTTPException(
+            400,
+            f"predicted_label must be one of {_VALID_LABELS}, got '{req.predicted_label}'",
+        )
+    if req.correction_label is not None and req.correction_label not in _VALID_LABELS:
+        raise HTTPException(
+            400,
+            f"correction_label must be one of {_VALID_LABELS} or null, got '{req.correction_label}'",
+        )
+
+    # ── Decode base64 ─────────────────────────────────────────────────────────
+    b64 = req.image_base64
+    if b64.startswith("data:"):
+        try:
+            b64 = b64.split(",", 1)[1]
+        except IndexError:
+            raise HTTPException(400, "Malformed data URL — missing comma separator.")
+
+    try:
+        img_bytes = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(400, "Invalid base64 payload — could not decode.")
+
+    if len(img_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(400, f"Image exceeds {MAX_FILE_SIZE // (1024*1024)} MB limit.")
+
+    # ── Extension ─────────────────────────────────────────────────────────────
+    ext = Path(req.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        ext = ".jpg"
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    try:
+        from .failure_logger import save_failure, get_collection_stats
+
+        saved_path = save_failure(
+            img_bytes=         img_bytes,
+            ext=               ext,
+            predicted_label=   req.predicted_label,
+            ai_probability=    req.ai_probability,
+            camera_probability= req.camera_probability,
+            confidence=        req.confidence,
+            correction_label=  req.correction_label,
+        )
+
+        # Determine which subfolder was used for the response message
+        subfolder = (
+            "ai"         if req.correction_label == "ai"     else
+            "real"       if req.correction_label == "camera" else
+            "unreviewed"
+        )
+        stats = get_collection_stats()
+        logger.info(
+            f"[ReportFailure] Saved to collect_failures/{subfolder}. "
+            f"Collection totals: {stats}"
+        )
+
+        return ReportFailureResponse(
+            success=    True,
+            message=    "Report saved. Thank you — this image will improve future accuracy.",
+            saved_path= saved_path,
+            subfolder=  subfolder,
+        )
+
+    except Exception as e:
+        logger.error(f"[ReportFailure] Failed to save image: {e}", exc_info=True)
+        raise HTTPException(500, f"Failed to save report: {e}")
+
+
 @router.get("/model-info", response_model=ModelInfoResponse)
 async def model_info():
     """Return information about the currently loaded DL model."""
@@ -456,7 +570,8 @@ async def health():
         "temperature":         info.get("temperature", 1.0),
         "device":              info["device"],
         "model_version":       info["model_version"],
-        "backend":             info["backend"],
+        "backend":             info["backend"],         # "pytorch" | "onnxruntime" | "none"
+        "checkpoint":          info.get("checkpoint"),  # filename of loaded checkpoint
         "branches":            ["RGB", "residual", "FFT"],
         "fusion_spec":         "70% DL / 20% frequency / 10% metadata",
     }
